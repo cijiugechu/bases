@@ -1,0 +1,145 @@
+// Copyright 2026 FastLabs Developers
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+use core::fmt;
+use core::marker::PhantomData;
+
+use serde_core::Deserializer;
+use serde_core::Serializer;
+use serde_core::de::Error;
+use serde_core::de::Visitor;
+
+use crate::Codec;
+use crate::codec;
+
+pub(crate) fn serialize<C, T, S>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    C: Codec,
+    T: ?Sized + AsRef<[u8]>,
+    S: Serializer,
+{
+    serializer.collect_str(&C::display(bytes.as_ref()))
+}
+
+pub(crate) fn deserialize_array<'de, C, D, const N: usize>(
+    deserializer: D,
+) -> Result<[u8; N], D::Error>
+where
+    C: Codec,
+    D: Deserializer<'de>,
+{
+    struct ArrayVisitor<C, const N: usize>(PhantomData<C>);
+
+    impl<C: Codec, const N: usize> Visitor<'_> for ArrayVisitor<C, N> {
+        type Value = [u8; N];
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a {} encoded string", C::name())
+        }
+
+        fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+            codec::decode_array::<C, N>(value.as_bytes()).map_err(E::custom)
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            codec::decode_array::<C, N>(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_str(ArrayVisitor::<C, N>(PhantomData))
+}
+
+#[cfg(feature = "alloc")]
+pub(crate) fn deserialize<'de, C, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    C: Codec,
+    D: Deserializer<'de>,
+{
+    struct VecVisitor<C>(PhantomData<C>);
+
+    impl<C: Codec> Visitor<'_> for VecVisitor<C> {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "a {} encoded string", C::name())
+        }
+
+        fn visit_str<E: Error>(self, value: &str) -> Result<Self::Value, E> {
+            codec::decode::<C>(value.as_bytes()).map_err(E::custom)
+        }
+
+        fn visit_bytes<E: Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+            codec::decode::<C>(value).map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_str(VecVisitor::<C>(PhantomData))
+}
+
+#[cfg(all(test, feature = "alloc"))]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use crate::Base16Lower;
+    use crate::Base64;
+    use crate::Base64UrlUnpadded;
+
+    #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+    struct Packet {
+        #[serde(with = "crate::Base64")]
+        payload: Vec<u8>,
+        #[serde(
+            serialize_with = "crate::Base16Lower::serialize",
+            deserialize_with = "crate::Base16Lower::deserialize_array"
+        )]
+        digest: [u8; 4],
+        #[serde(with = "crate::Base64UrlUnpadded")]
+        cursor: Vec<u8>,
+    }
+
+    #[test]
+    fn serde_with_profile_roundtrip() {
+        let packet = Packet {
+            payload: vec![0x66, 0x6f, 0x6f],
+            digest: [0xde, 0xad, 0xbe, 0xef],
+            cursor: vec![0xfb, 0xff],
+        };
+
+        let json = serde_json::to_string(&packet).unwrap();
+        assert_eq!(
+            json,
+            r#"{"payload":"Zm9v","digest":"deadbeef","cursor":"-_8"}"#
+        );
+
+        let decoded: Packet = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_length_and_data() {
+        let bad_len = r#"{"payload":"Zm9v","digest":"dead","cursor":"-_8"}"#;
+        assert!(serde_json::from_str::<Packet>(bad_len).is_err());
+
+        let bad_char = r#"{"payload":"Zm!v","digest":"deadbeef","cursor":"-_8"}"#;
+        assert!(serde_json::from_str::<Packet>(bad_char).is_err());
+
+        let _ = (Base64::new(), Base16Lower::new(), Base64UrlUnpadded::new());
+    }
+}
