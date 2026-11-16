@@ -14,6 +14,8 @@
 
 //! Base16 (hexadecimal) backend dispatch.
 
+use core::mem::MaybeUninit;
+
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 mod aarch64;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -25,14 +27,17 @@ mod wasm32;
 mod x86;
 
 #[inline]
-pub fn encode<const UPPERCASE: bool>(input: &[u8], output: &mut [u8]) -> (usize, usize) {
+pub fn encode<const UPPERCASE: bool>(
+    input: &[u8],
+    output: &mut [MaybeUninit<u8>],
+) -> (usize, usize) {
     if cfg!(miri) {
         return (0, 0);
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        return self::aarch64::encode::<UPPERCASE>(input, output);
+        return aarch64::encode::<UPPERCASE>(input, output);
     }
 
     #[cfg(all(
@@ -40,12 +45,12 @@ pub fn encode<const UPPERCASE: bool>(input: &[u8], output: &mut [u8]) -> (usize,
         any(feature = "std", target_feature = "avx2", target_feature = "ssse3")
     ))]
     {
-        return self::x86::encode::<UPPERCASE>(input, output);
+        return x86::encode::<UPPERCASE>(input, output);
     }
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        return self::wasm32::encode::<UPPERCASE>(input, output);
+        return wasm32::encode::<UPPERCASE>(input, output);
     }
 
     #[allow(unreachable_code)]
@@ -57,7 +62,7 @@ pub fn encode<const UPPERCASE: bool>(input: &[u8], output: &mut [u8]) -> (usize,
 #[inline]
 pub fn decode<const UPPERCASE: bool, const STRICT_CASE: bool>(
     input: &[u8],
-    output: &mut [u8],
+    output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize) {
     if cfg!(miri) {
         return (0, 0);
@@ -65,7 +70,7 @@ pub fn decode<const UPPERCASE: bool, const STRICT_CASE: bool>(
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        return self::aarch64::decode::<UPPERCASE, STRICT_CASE>(input, output);
+        return aarch64::decode::<UPPERCASE, STRICT_CASE>(input, output);
     }
 
     #[cfg(all(
@@ -73,12 +78,12 @@ pub fn decode<const UPPERCASE: bool, const STRICT_CASE: bool>(
         any(feature = "std", target_feature = "avx2", target_feature = "ssse3")
     ))]
     {
-        return self::x86::decode::<UPPERCASE, STRICT_CASE>(input, output);
+        return x86::decode::<UPPERCASE, STRICT_CASE>(input, output);
     }
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        return self::wasm32::decode::<UPPERCASE, STRICT_CASE>(input, output);
+        return wasm32::decode::<UPPERCASE, STRICT_CASE>(input, output);
     }
 
     #[allow(unreachable_code)]
@@ -97,7 +102,7 @@ pub fn decode_in_place<const UPPERCASE: bool, const STRICT_CASE: bool>(
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        return self::aarch64::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
+        return aarch64::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
     }
 
     #[cfg(all(
@@ -105,12 +110,12 @@ pub fn decode_in_place<const UPPERCASE: bool, const STRICT_CASE: bool>(
         any(feature = "std", target_feature = "avx2", target_feature = "ssse3")
     ))]
     {
-        return self::x86::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
+        return x86::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
     }
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        return self::wasm32::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
+        return wasm32::decode_in_place::<UPPERCASE, STRICT_CASE>(buf);
     }
 
     #[allow(unreachable_code)]

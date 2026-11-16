@@ -22,6 +22,14 @@ use core::fmt;
 use core::hash::Hash;
 use core::hash::Hasher;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+#[cfg(feature = "std")]
+use std::io;
+
+#[cfg(feature = "serde")]
+use serde_core::Deserializer;
+#[cfg(feature = "serde")]
+use serde_core::Serializer;
 
 use crate::DecodeError;
 use crate::DecodeSliceError;
@@ -30,10 +38,17 @@ use crate::EncodeError;
 use crate::EncodedDisplay;
 use crate::Encoder;
 use crate::backend;
+use crate::backend::DecodePlan;
 use crate::codec;
 use crate::codec::sealed::Profile;
+#[cfg(feature = "std")]
+use crate::io::DecoderReader;
+#[cfg(feature = "std")]
+use crate::io::EncoderWriter;
 use crate::policy;
 use crate::policy::sealed::PaddingPolicy;
+#[cfg(feature = "serde")]
+use crate::serde;
 
 /// The RFC 4648 standard Base64 alphabet (`A-Z`, `a-z`, `0-9`, `+`, `/`).
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -277,8 +292,8 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[must_use]
     #[inline]
-    pub fn encoder_writer<W: std::io::Write>(writer: W) -> crate::io::EncoderWriter<Self, W> {
-        crate::io::EncoderWriter::new(writer)
+    pub fn encoder_writer<W: io::Write>(writer: W) -> EncoderWriter<Self, W> {
+        EncoderWriter::new(writer)
     }
 
     /// Wraps `reader` in a decoding reader for this profile.
@@ -286,8 +301,8 @@ where
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     #[must_use]
     #[inline]
-    pub fn decoder_reader<R: std::io::Read>(reader: R) -> crate::io::DecoderReader<Self, R> {
-        crate::io::DecoderReader::new(reader)
+    pub fn decoder_reader<R: io::Read>(reader: R) -> DecoderReader<Self, R> {
+        DecoderReader::new(reader)
     }
 
     /// Serializes `bytes` as an encoded string with `serde`.
@@ -298,11 +313,11 @@ where
     #[cfg(feature = "serde")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
     #[inline]
-    pub fn serialize<T: ?Sized + AsRef<[u8]>, S: serde_core::Serializer>(
+    pub fn serialize<T: ?Sized + AsRef<[u8]>, S: Serializer>(
         bytes: &T,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        crate::serde::serialize::<Self, T, S>(bytes, serializer)
+        serde::serialize::<Self, T, S>(bytes, serializer)
     }
 
     /// Deserializes an encoded string into a fixed-size byte array with `serde`.
@@ -314,10 +329,10 @@ where
     #[cfg(feature = "serde")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
     #[inline]
-    pub fn deserialize_array<'de, D: serde_core::Deserializer<'de>, const N: usize>(
+    pub fn deserialize_array<'de, D: Deserializer<'de>, const N: usize>(
         deserializer: D,
     ) -> Result<[u8; N], D::Error> {
-        crate::serde::deserialize_array::<Self, D, N>(deserializer)
+        serde::deserialize_array::<Self, D, N>(deserializer)
     }
 
     /// Deserializes an encoded string into a byte vector with `serde`.
@@ -329,10 +344,8 @@ where
     #[cfg(all(feature = "serde", feature = "alloc"))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "serde", feature = "alloc"))))]
     #[inline]
-    pub fn deserialize<'de, D: serde_core::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        crate::serde::deserialize::<Self, D>(deserializer)
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        serde::deserialize::<Self, D>(deserializer)
     }
 }
 
@@ -361,16 +374,16 @@ where
     }
 
     #[inline]
-    fn decoded_len_impl(input: &[u8]) -> Result<usize, DecodeError> {
+    fn decode_plan_impl(input: &[u8]) -> Result<DecodePlan, DecodeError> {
         if Padding::PADDED {
-            backend::base64::decoded_len::<true>(input)
+            backend::base64::decode_plan::<true>(input)
         } else {
-            backend::base64::decoded_len::<false>(input)
+            backend::base64::decode_plan::<false>(input)
         }
     }
 
     #[inline]
-    fn encode_impl(input: &[u8], output: &mut [u8]) -> usize {
+    fn encode_impl(input: &[u8], output: &mut [MaybeUninit<u8>]) -> usize {
         match (Alphabet::URL_SAFE, Padding::PADDED) {
             (false, false) => backend::base64::encode::<false, false>(input, output),
             (false, true) => backend::base64::encode::<false, true>(input, output),
@@ -380,12 +393,36 @@ where
     }
 
     #[inline]
-    fn decode_impl(input: &[u8], output: &mut [u8]) -> Result<usize, DecodeError> {
-        match (Alphabet::URL_SAFE, Padding::PADDED) {
-            (false, false) => backend::base64::decode::<false, false>(input, output),
-            (false, true) => backend::base64::decode::<false, true>(input, output),
-            (true, false) => backend::base64::decode::<true, false>(input, output),
-            (true, true) => backend::base64::decode::<true, true>(input, output),
+    fn encode_quantum_impl(input: &[u8], output: &mut [MaybeUninit<u8>]) -> usize {
+        if Alphabet::URL_SAFE {
+            backend::base64::encode_quantum::<true>(input, output)
+        } else {
+            backend::base64::encode_quantum::<false>(input, output)
+        }
+    }
+
+    #[inline]
+    fn decode_with_plan_impl(
+        input: &[u8],
+        plan: DecodePlan,
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<usize, DecodeError> {
+        if Alphabet::URL_SAFE {
+            backend::base64::decode_with_plan::<true>(input, plan, output)
+        } else {
+            backend::base64::decode_with_plan::<false>(input, plan, output)
+        }
+    }
+
+    #[inline]
+    fn decode_quantum_impl(
+        input: &[u8],
+        output: &mut [MaybeUninit<u8>],
+    ) -> Result<usize, DecodeError> {
+        if Alphabet::URL_SAFE {
+            backend::base64::decode_quantum::<true>(input, output)
+        } else {
+            backend::base64::decode_quantum::<false>(input, output)
         }
     }
 

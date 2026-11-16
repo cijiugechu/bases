@@ -17,6 +17,8 @@
 use core::arch::aarch64::int16x8_t;
 use core::arch::aarch64::uint8x16_t;
 use core::arch::aarch64::uint8x16x2_t;
+use core::arch::aarch64::uint16x8_t;
+use core::arch::aarch64::uint32x4_t;
 use core::arch::aarch64::vaddq_u8;
 use core::arch::aarch64::vandq_u8;
 use core::arch::aarch64::vandq_u16;
@@ -28,6 +30,7 @@ use core::arch::aarch64::vget_low_u8;
 use core::arch::aarch64::vgetq_lane_u16;
 use core::arch::aarch64::vld1q_s16;
 use core::arch::aarch64::vld1q_u8;
+use core::arch::aarch64::vminq_u8;
 use core::arch::aarch64::vminvq_u8;
 use core::arch::aarch64::vorrq_u8;
 use core::arch::aarch64::vorrq_u16;
@@ -50,6 +53,8 @@ use core::arch::aarch64::vshrq_n_u32;
 use core::arch::aarch64::vshrq_n_u64;
 use core::arch::aarch64::vst1_u8;
 use core::arch::aarch64::vst1q_u8;
+use core::mem::MaybeUninit;
+use core::ptr;
 
 const STANDARD_UPPER: [u8; 32] = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const STANDARD_LOWER: [u8; 32] = *b"abcdefghijklmnopqrstuvwxyz234567";
@@ -98,7 +103,7 @@ const fn select_hi_mask<const UPPERCASE: bool, const STRICT_CASE: bool>() -> &'s
 #[inline]
 pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     input: &[u8],
-    output: &mut [u8],
+    output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize) {
     if input.len() < 16 {
         return (0, 0);
@@ -108,10 +113,15 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
         return (0, 0);
     }
 
-    // SAFETY: `chunks > 0` implies `input.len() >= (chunks - 1) * 10 + 16` and
-    // `output.len() >= chunks * 16`. NEON is baseline on aarch64.
+    // SAFETY: `chunks > 0` implies `input.len() >= (chunks - 1) * 10 + 16`,
+    // `output.len() >= chunks * 16`, `MaybeUninit<u8>` has the same layout as `u8`, and NEON is
+    // baseline on aarch64.
     unsafe {
-        encode_neon::<EXTENDED_HEX, UPPERCASE>(input.as_ptr(), output.as_mut_ptr(), chunks);
+        encode_neon::<EXTENDED_HEX, UPPERCASE>(
+            input.as_ptr(),
+            output.as_mut_ptr().cast::<u8>(),
+            chunks,
+        );
     }
     (chunks * 10, chunks * 16)
 }
@@ -119,19 +129,22 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
 #[inline]
 pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
     input: &[u8],
-    output: &mut [u8],
+    output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize) {
     let chunks = (input.len() / 16).min(output.len() / 10);
     if chunks == 0 {
         return (0, 0);
     }
 
-    // SAFETY: `chunks * 16 <= input.len()` and `chunks * 10 <= output.len()`, and NEON is baseline.
+    // SAFETY: `chunks * 16 <= input.len()`, `chunks * 10 <= output.len()`, non-final wide stores
+    // stay within `output.len()`, `MaybeUninit<u8>` has the same layout as `u8`, and NEON is
+    // baseline.
     let done = unsafe {
         decode_neon::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(
             input.as_ptr(),
-            output.as_mut_ptr(),
+            output.as_mut_ptr().cast::<u8>(),
             chunks,
+            output.len(),
         )
     };
     (done * 16, done * 10)
@@ -141,16 +154,20 @@ pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE
 pub fn decode_in_place<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
     buf: &mut [u8],
     complete_len: usize,
+    required: usize,
 ) -> (usize, usize) {
     let chunks = complete_len.min(buf.len()) / 16;
     if chunks == 0 {
         return (0, 0);
     }
 
-    // SAFETY: `chunks * 16 <= buf.len()`. Every iteration loads 16 bytes before storing 10 bytes,
-    // and `out_ptr` advances by 10 while `in_ptr` advances by 16.
+    let out_len = required.min(buf.len());
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: `chunks * 16 <= buf.len()`. Each iteration or pair loads all 16 or 32 input bytes
+    // before storing, bounded wide stores stay within `out_len`, and `out_ptr` advances strictly
+    // slower than `in_ptr` (`10k + 16 <= 16(k + 1)` and `10k + 26 <= 16(k + 2)`).
     let done = unsafe {
-        decode_in_place_neon::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(buf.as_mut_ptr(), chunks)
+        decode_neon::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(ptr.cast_const(), ptr, chunks, out_len)
     };
     (done * 16, done * 10)
 }
@@ -193,14 +210,18 @@ unsafe fn encode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
 
 /// # Safety
 ///
-/// Caller must ensure `in_ptr` is valid for `chunks * 16` reads and `out_ptr` is valid for
-/// `chunks * 10` non-overlapping writes, with NEON enabled.
+/// Caller must ensure `in_ptr` is valid for `chunks * 16` reads, `out_ptr` is valid for
+/// `out_len >= chunks * 10` writes, and NEON is enabled. `out_ptr` must either not overlap
+/// `in_ptr` or equal `in_ptr` (every iteration or pair loads all its input before storing,
+/// wide 16-byte stores require `10 * k + 16 <= out_len`, and `out_ptr` never overtakes unread
+/// input).
 #[inline]
 #[target_feature(enable = "neon")]
 unsafe fn decode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
     mut in_ptr: *const u8,
     mut out_ptr: *mut u8,
     chunks: usize,
+    out_len: usize,
 ) -> usize {
     let hi_mask_ptr = select_hi_mask::<UPPERCASE, STRICT_CASE>().as_ptr();
     let lo_mask_ptr = if EXTENDED_HEX {
@@ -210,10 +231,12 @@ unsafe fn decode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STR
     }
     .as_ptr();
     let roll_ptr = if EXTENDED_HEX { &ROLL_HEX } else { &ROLL_STD }.as_ptr();
+    let wide_chunks = (out_len.saturating_sub(6) / 10).min(chunks);
     let mut done = 0;
 
-    // SAFETY: Caller guarantees `chunks * 16` reads at `in_ptr`, `chunks * 10` writes at `out_ptr`,
-    // and static lookup tables are 16 bytes each.
+    // SAFETY: Caller guarantees `chunks * 16` reads at `in_ptr`, `out_len >= chunks * 10` writes at
+    // `out_ptr`, non-overtaking pointer advancement for in-place decoding, and 16-byte static
+    // lookup tables.
     unsafe {
         let hi_mask_tbl = vld1q_u8(hi_mask_ptr);
         let lo_mask_tbl = vld1q_u8(lo_mask_ptr);
@@ -223,89 +246,39 @@ unsafe fn decode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STR
         let mask_001f = vdupq_n_u16(0x001f);
         let mask_03ff = vdupq_n_u32(0x03ff);
 
-        while done < chunks {
-            let v = vld1q_u8(in_ptr);
-            let Some(res) = decode_chunk_16_neon(
-                v,
-                hi_mask_tbl,
-                lo_mask_tbl,
-                roll_tbl,
-                pack_shuf,
-                mask_0f,
-                mask_001f,
-                mask_03ff,
-            ) else {
-                break;
-            };
-            vst1_u8(out_ptr, vget_low_u8(res));
-            core::ptr::write_unaligned(
-                out_ptr.add(8).cast::<u16>(),
-                vgetq_lane_u16::<4>(vreinterpretq_u16_u8(res)),
-            );
-            in_ptr = in_ptr.add(16);
-            out_ptr = out_ptr.add(10);
-            done += 1;
+        while done + 2 <= wide_chunks {
+            let v0 = vld1q_u8(in_ptr);
+            let v1 = vld1q_u8(in_ptr.add(16));
+            let (hi0, chk0) = classify_chunk_16_neon(v0, hi_mask_tbl, lo_mask_tbl, mask_0f);
+            let (hi1, chk1) = classify_chunk_16_neon(v1, hi_mask_tbl, lo_mask_tbl, mask_0f);
+            if vminvq_u8(vminq_u8(chk0, chk1)) == 0 {
+                return done;
+            }
+            let res0 = pack_chunk_16_neon(v0, hi0, roll_tbl, pack_shuf, mask_001f, mask_03ff);
+            let res1 = pack_chunk_16_neon(v1, hi1, roll_tbl, pack_shuf, mask_001f, mask_03ff);
+            vst1q_u8(out_ptr, res0);
+            vst1q_u8(out_ptr.add(10), res1);
+            in_ptr = in_ptr.add(32);
+            out_ptr = out_ptr.add(20);
+            done += 2;
         }
-    }
-    done
-}
-
-/// # Safety
-///
-/// Caller must ensure `ptr` is valid for `chunks * 16` reads and writes, with NEON enabled.
-#[inline]
-#[target_feature(enable = "neon")]
-unsafe fn decode_in_place_neon<
-    const EXTENDED_HEX: bool,
-    const UPPERCASE: bool,
-    const STRICT_CASE: bool,
->(
-    ptr: *mut u8,
-    chunks: usize,
-) -> usize {
-    let hi_mask_ptr = select_hi_mask::<UPPERCASE, STRICT_CASE>().as_ptr();
-    let lo_mask_ptr = if EXTENDED_HEX {
-        &LO_MASK_HEX
-    } else {
-        &LO_MASK_STD
-    }
-    .as_ptr();
-    let roll_ptr = if EXTENDED_HEX { &ROLL_HEX } else { &ROLL_STD }.as_ptr();
-    let mut in_ptr: *const u8 = ptr;
-    let mut out_ptr: *mut u8 = ptr;
-    let mut done = 0;
-
-    // SAFETY: Caller guarantees `chunks * 16` readable/writable bytes from `ptr`. Each iteration
-    // loads `in_ptr[0..16]` completely before writing `out_ptr[0..10]`, and `out_ptr` lags behind
-    // `in_ptr` by at least `6 * done` bytes.
-    unsafe {
-        let hi_mask_tbl = vld1q_u8(hi_mask_ptr);
-        let lo_mask_tbl = vld1q_u8(lo_mask_ptr);
-        let roll_tbl = vld1q_u8(roll_ptr);
-        let pack_shuf = vld1q_u8(PACK_SHUF.as_ptr());
-        let mask_0f = vdupq_n_u8(0x0f);
-        let mask_001f = vdupq_n_u16(0x001f);
-        let mask_03ff = vdupq_n_u32(0x03ff);
 
         while done < chunks {
             let v = vld1q_u8(in_ptr);
-            let Some(res) = decode_chunk_16_neon(
-                v,
-                hi_mask_tbl,
-                lo_mask_tbl,
-                roll_tbl,
-                pack_shuf,
-                mask_0f,
-                mask_001f,
-                mask_03ff,
-            ) else {
-                break;
-            };
-            vst1_u8(out_ptr, vget_low_u8(res));
-            core::ptr::write_unaligned(
-                out_ptr.add(8).cast::<u16>(),
-                vgetq_lane_u16::<4>(vreinterpretq_u16_u8(res)),
-            );
+            let (hi, chk) = classify_chunk_16_neon(v, hi_mask_tbl, lo_mask_tbl, mask_0f);
+            if vminvq_u8(chk) == 0 {
+                return done;
+            }
+            let res = pack_chunk_16_neon(v, hi, roll_tbl, pack_shuf, mask_001f, mask_03ff);
+            if done < wide_chunks {
+                vst1q_u8(out_ptr, res);
+            } else {
+                vst1_u8(out_ptr, vget_low_u8(res));
+                ptr::write_unaligned(
+                    out_ptr.add(8).cast::<u16>(),
+                    vgetq_lane_u16::<4>(vreinterpretq_u16_u8(res)),
+                );
+            }
             in_ptr = in_ptr.add(16);
             out_ptr = out_ptr.add(10);
             done += 1;
@@ -319,24 +292,31 @@ unsafe fn decode_in_place_neon<
 /// Requires NEON target feature.
 #[inline]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn decode_chunk_16_neon(
+unsafe fn classify_chunk_16_neon(
     v: uint8x16_t,
     hi_mask_tbl: uint8x16_t,
     lo_mask_tbl: uint8x16_t,
-    roll_tbl: uint8x16_t,
-    pack_shuf: uint8x16_t,
     mask_0f: uint8x16_t,
-    mask_001f: core::arch::aarch64::uint16x8_t,
-    mask_03ff: core::arch::aarch64::uint32x4_t,
-) -> Option<uint8x16_t> {
+) -> (uint8x16_t, uint8x16_t) {
     let hi = vshrq_n_u8::<4>(v);
     let lo = vandq_u8(v, mask_0f);
     let chk = vandq_u8(vqtbl1q_u8(hi_mask_tbl, hi), vqtbl1q_u8(lo_mask_tbl, lo));
-    if vminvq_u8(chk) == 0 {
-        return None;
-    }
+    (hi, chk)
+}
 
+/// # Safety
+///
+/// Requires NEON target feature.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn pack_chunk_16_neon(
+    v: uint8x16_t,
+    hi: uint8x16_t,
+    roll_tbl: uint8x16_t,
+    pack_shuf: uint8x16_t,
+    mask_001f: uint16x8_t,
+    mask_03ff: uint32x4_t,
+) -> uint8x16_t {
     let vals = vaddq_u8(v, vqtbl1q_u8(roll_tbl, hi));
     let vals_u16 = vreinterpretq_u16_u8(vals);
     let lo_byte = vandq_u16(vals_u16, mask_001f);
@@ -351,5 +331,5 @@ unsafe fn decode_chunk_16_neon(
 
     let p20_u64 = vreinterpretq_u64_u32(p20);
     let q = vorrq_u64(vshlq_n_u64::<20>(p20_u64), vshrq_n_u64::<32>(p20_u64));
-    Some(vqtbl1q_u8(vreinterpretq_u8_u64(q), pack_shuf))
+    vqtbl1q_u8(vreinterpretq_u8_u64(q), pack_shuf)
 }

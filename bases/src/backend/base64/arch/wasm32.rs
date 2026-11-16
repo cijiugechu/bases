@@ -41,6 +41,8 @@ use core::arch::wasm32::v128_and;
 use core::arch::wasm32::v128_load;
 use core::arch::wasm32::v128_or;
 use core::arch::wasm32::v128_store;
+use core::mem::MaybeUninit;
+use core::ptr;
 
 const SHUF_12: v128 = u8x16(1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10);
 
@@ -63,7 +65,10 @@ const ROLL_STD: v128 = u8x16(0, 0, 19, 4, 0xbf, 0xbf, 0xb9, 0xb9, 0, 0, 0, 0, 0,
 const ROLL_URL: v128 = u8x16(0, 0, 17, 4, 0xbf, 0xbf, 0xb9, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0);
 
 #[inline]
-pub fn encode<const URL_SAFE_ALPHABET: bool>(input: &[u8], output: &mut [u8]) -> (usize, usize) {
+pub fn encode<const URL_SAFE_ALPHABET: bool>(
+    input: &[u8],
+    output: &mut [MaybeUninit<u8>],
+) -> (usize, usize) {
     if input.len() < 16 {
         return (0, 0);
     }
@@ -86,7 +91,7 @@ pub fn encode<const URL_SAFE_ALPHABET: bool>(input: &[u8], output: &mut [u8]) ->
     let c13 = u8x16_splat(13);
 
     let mut in_ptr = input.as_ptr();
-    let mut out_ptr = output.as_mut_ptr();
+    let mut out_ptr = output.as_mut_ptr().cast::<u8>();
 
     for _ in 0..chunks {
         // SAFETY: `chunks > 0` implies `input.len() >= (chunks - 1) * 12 + 16`.
@@ -115,70 +120,97 @@ pub fn encode<const URL_SAFE_ALPHABET: bool>(input: &[u8], output: &mut [u8]) ->
 #[inline]
 pub fn decode<const URL_SAFE_ALPHABET: bool>(
     input: &[u8],
-    output: &mut [u8],
+    output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize, bool) {
     let chunks = (input.len() / 16).min(output.len() / 12);
     if chunks == 0 {
         return (0, 0, false);
     }
 
-    let mut input_index = 0;
-    let mut output_index = 0;
-    let mut done = 0;
-    let mut had_invalid = false;
-
-    while done < chunks {
-        // SAFETY: `chunks * 16 <= input.len()`, so `input_index + 16 <= input.len()`.
-        let v = unsafe { v128_load(input.as_ptr().add(input_index).cast()) };
-        let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(v) else {
-            had_invalid = true;
-            break;
-        };
-        let lo = u64x2_extract_lane::<0>(res);
-        let hi = u32x4_extract_lane::<2>(res);
-        output[output_index..output_index + 8].copy_from_slice(&lo.to_le_bytes());
-        output[output_index + 8..output_index + 12].copy_from_slice(&hi.to_le_bytes());
-        input_index += 16;
-        output_index += 12;
-        done += 1;
-    }
-
-    (input_index, output_index, had_invalid)
+    // SAFETY: `chunks * 16 <= input.len()`, `chunks * 12 <= output.len()`, and non-final 16-byte
+    // wide stores stay within `output.len()`.
+    let (done, had_invalid) = unsafe {
+        decode_wasm32::<URL_SAFE_ALPHABET>(
+            input.as_ptr(),
+            output.as_mut_ptr().cast::<u8>(),
+            chunks,
+            output.len(),
+        )
+    };
+    (done * 16, done * 12, had_invalid)
 }
 
 #[inline]
 pub fn decode_in_place<const URL_SAFE_ALPHABET: bool>(
     buf: &mut [u8],
     complete_len: usize,
+    required: usize,
 ) -> (usize, usize, bool) {
     let chunks = complete_len.min(buf.len()) / 16;
     if chunks == 0 {
         return (0, 0, false);
     }
 
-    let mut input_index = 0;
-    let mut output_index = 0;
-    let mut done = 0;
-    let mut had_invalid = false;
+    let out_len = required.min(buf.len());
+    let ptr = buf.as_mut_ptr();
+    // SAFETY: `chunks * 16 <= buf.len()`. Every iteration loads 16 input bytes before writing,
+    // bounded 16-byte stores stay within `out_len`, and `out_ptr` advances strictly slower than
+    // `in_ptr` (`12k + 16 <= 16(k + 1)`).
+    let (done, had_invalid) =
+        unsafe { decode_wasm32::<URL_SAFE_ALPHABET>(ptr.cast_const(), ptr, chunks, out_len) };
+    (done * 16, done * 12, had_invalid)
+}
 
-    while done < chunks {
-        // SAFETY: `chunks * 16 <= buf.len()`. `v128_load` reads `buf[input_index..input_index +
-        // 16]` completely before writing `buf[output_index..output_index + 12]`.
-        let v = unsafe { v128_load(buf.as_ptr().add(input_index).cast()) };
+/// # Safety
+///
+/// Caller must ensure `in_ptr` is valid for `chunks * 16` reads and `out_ptr` is valid for
+/// `out_len >= chunks * 12` writes. `out_ptr` must either not overlap `in_ptr` or equal `in_ptr`
+/// (each iteration loads 16 input bytes before writing, and bounded 16-byte stores satisfy
+/// `12k + 16 <= 16(k + 1)` so `out_ptr` never overtakes unread input).
+#[inline]
+unsafe fn decode_wasm32<const URL_SAFE_ALPHABET: bool>(
+    mut in_ptr: *const u8,
+    mut out_ptr: *mut u8,
+    chunks: usize,
+    out_len: usize,
+) -> (usize, bool) {
+    let wide_chunks = (out_len.saturating_sub(4) / 12).min(chunks);
+    let mut done = 0;
+
+    while done < wide_chunks {
+        // SAFETY: Caller guarantees `chunks * 16` reads at `in_ptr`.
+        let v = unsafe { v128_load(in_ptr.cast()) };
         let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(v) else {
-            had_invalid = true;
-            break;
+            return (done, true);
         };
-        let lo = u64x2_extract_lane::<0>(res);
-        let hi = u32x4_extract_lane::<2>(res);
-        buf[output_index..output_index + 8].copy_from_slice(&lo.to_le_bytes());
-        buf[output_index + 8..output_index + 12].copy_from_slice(&hi.to_le_bytes());
-        input_index += 16;
-        output_index += 12;
+        // SAFETY: `done < wide_chunks` guarantees `done * 12 + 16 <= out_len`, and in-place writes
+        // lag behind `in_ptr` so unread input is never overwritten.
+        unsafe {
+            v128_store(out_ptr.cast(), res);
+            in_ptr = in_ptr.add(16);
+            out_ptr = out_ptr.add(12);
+        }
         done += 1;
     }
 
-    (input_index, output_index, had_invalid)
+    if done < chunks {
+        // SAFETY: Caller guarantees `chunks * 16` reads at `in_ptr`.
+        let v = unsafe { v128_load(in_ptr.cast()) };
+        let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(v) else {
+            return (done, true);
+        };
+        let lo = u64x2_extract_lane::<0>(res);
+        let hi = u32x4_extract_lane::<2>(res);
+        // SAFETY: Caller guarantees `chunks * 12` writes at `out_ptr`, and in-place writes lag
+        // behind `in_ptr` so unread input is never overwritten.
+        unsafe {
+            ptr::write_unaligned(out_ptr.cast::<[u8; 8]>(), lo.to_le_bytes());
+            ptr::write_unaligned(out_ptr.add(8).cast::<[u8; 4]>(), hi.to_le_bytes());
+        }
+        done += 1;
+    }
+
+    (done, false)
 }
 
 #[inline]
