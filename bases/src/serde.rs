@@ -25,7 +25,7 @@ use serde_core::de::Visitor;
 use crate::Codec;
 use crate::codec;
 
-pub(crate) fn serialize<C, T, S>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error>
+pub fn serialize<C, T, S>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error>
 where
     C: Codec,
     T: ?Sized + AsRef<[u8]>,
@@ -34,9 +34,7 @@ where
     serializer.collect_str(&C::display(bytes.as_ref()))
 }
 
-pub(crate) fn deserialize_array<'de, C, D, const N: usize>(
-    deserializer: D,
-) -> Result<[u8; N], D::Error>
+pub fn deserialize_array<'de, C, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
 where
     C: Codec,
     D: Deserializer<'de>,
@@ -63,7 +61,7 @@ where
 }
 
 #[cfg(feature = "alloc")]
-pub(crate) fn deserialize<'de, C, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+pub fn deserialize<'de, C, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
 where
     C: Codec,
     D: Deserializer<'de>,
@@ -141,5 +139,37 @@ mod tests {
         assert!(serde_json::from_str::<Packet>(bad_char).is_err());
 
         let _ = (Base64::new(), Base16Lower::new(), Base64UrlUnpadded::new());
+    }
+}
+
+#[cfg(all(test, not(feature = "alloc")))]
+mod tests_no_alloc {
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use crate::Base64;
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Digest {
+        #[serde(
+            serialize_with = "Base64::serialize",
+            deserialize_with = "Base64::deserialize_array"
+        )]
+        bytes: [u8; 3],
+    }
+
+    #[test]
+    fn fixed_array_serde_without_alloc() {
+        let digest = Digest { bytes: *b"foo" };
+        let wire = r#"{"bytes":"Zm9v"}"#;
+        assert_eq!(serde_json::to_string(&digest).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Digest>(wire).unwrap(), digest);
+        for invalid in [
+            r#"{"bytes":"Zg=="}"#,
+            r#"{"bytes":"Zm9vYg=="}"#,
+            r#"{"bytes":"Zm!v"}"#,
+        ] {
+            assert!(serde_json::from_str::<Digest>(invalid).is_err());
+        }
     }
 }
