@@ -350,7 +350,7 @@ where
         backend::base16::decode_plan(input)
     }
 
-    #[inline]
+    #[inline(always)]
     fn encode_impl(input: &[u8], output: &mut [MaybeUninit<u8>]) -> usize {
         if Case::UPPERCASE {
             backend::base16::encode::<true>(input, output)

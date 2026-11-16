@@ -342,7 +342,7 @@ fn encode_quantum_3(alphabet: &[u8; 64], w: u32) -> [u8; 4] {
     ]
 }
 
-#[inline]
+#[inline(always)]
 fn encode_scalar_from<const URL_SAFE_ALPHABET: bool, const PADDED: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
