@@ -127,28 +127,28 @@ const fn select_hi_mask<const UPPERCASE: bool, const STRICT_CASE: bool>() -> [i8
 pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     if input.len() < 16 || output.len() < 16 {
-        return (0, 0);
+        return Some((0, 0));
     }
 
     #[cfg(target_feature = "avx2")]
     {
         // SAFETY: `target_feature = "avx2"` is enabled at compile time.
-        unsafe { encode_avx2::<EXTENDED_HEX, UPPERCASE>(input, output) }
+        Some(unsafe { encode_avx2::<EXTENDED_HEX, UPPERCASE>(input, output) })
     }
 
     #[cfg(all(not(target_feature = "avx2"), feature = "std"))]
     {
         if is_x86_feature_detected!("avx2") {
             // SAFETY: Runtime feature detection confirmed AVX2 support.
-            unsafe { encode_avx2::<EXTENDED_HEX, UPPERCASE>(input, output) }
+            Some(unsafe { encode_avx2::<EXTENDED_HEX, UPPERCASE>(input, output) })
         } else if is_x86_feature_detected!("ssse3") {
             // SAFETY: Runtime feature detection confirmed SSSE3 support.
-            unsafe { encode_ssse3::<EXTENDED_HEX, UPPERCASE>(input, output) }
+            Some(unsafe { encode_ssse3::<EXTENDED_HEX, UPPERCASE>(input, output) })
         } else {
             let _ = (input, output);
-            (0, 0)
+            None
         }
     }
 
@@ -159,7 +159,7 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     ))]
     {
         // SAFETY: `target_feature = "ssse3"` is enabled at compile time.
-        unsafe { encode_ssse3::<EXTENDED_HEX, UPPERCASE>(input, output) }
+        Some(unsafe { encode_ssse3::<EXTENDED_HEX, UPPERCASE>(input, output) })
     }
 }
 
@@ -167,10 +167,10 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
 pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     let chunks_16 = (input.len() / 16).min(output.len() / 10);
     if chunks_16 == 0 {
-        return (0, 0);
+        return Some((0, 0));
     }
 
     let in_ptr = input.as_ptr();
@@ -208,7 +208,7 @@ pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE
                 }
             } else {
                 let _ = (in_ptr, out_ptr, out_len);
-                0
+                return None;
             }
         }
 
@@ -228,7 +228,7 @@ pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE
         }
     };
 
-    (done_16 * 16, done_16 * 10)
+    Some((done_16 * 16, done_16 * 10))
 }
 
 #[inline]

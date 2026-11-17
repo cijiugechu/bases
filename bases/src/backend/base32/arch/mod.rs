@@ -28,14 +28,14 @@ mod x86;
 pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     if cfg!(miri) {
-        return (0, 0);
+        return None;
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        return aarch64::encode::<EXTENDED_HEX, UPPERCASE>(input, output);
+        return Some(aarch64::encode::<EXTENDED_HEX, UPPERCASE>(input, output));
     }
 
     #[cfg(all(
@@ -49,21 +49,23 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     #[allow(unreachable_code)]
     let _ = (input, output);
     #[allow(unreachable_code)]
-    (0, 0)
+    None
 }
 
 #[inline]
 pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
-) -> (usize, usize) {
+) -> Option<(usize, usize)> {
     if cfg!(miri) {
-        return (0, 0);
+        return None;
     }
 
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
-        return aarch64::decode::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(input, output);
+        return Some(aarch64::decode::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(
+            input, output,
+        ));
     }
 
     #[cfg(all(
@@ -77,7 +79,7 @@ pub fn decode<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE
     #[allow(unreachable_code)]
     let _ = (input, output);
     #[allow(unreachable_code)]
-    (0, 0)
+    None
 }
 
 #[inline]

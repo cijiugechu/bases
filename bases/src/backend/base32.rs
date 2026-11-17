@@ -24,6 +24,8 @@ use crate::codec;
 #[allow(unsafe_code)]
 mod arch;
 
+const SCALAR_BULK_QUANTA: usize = 32;
+
 const STANDARD_UPPER: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const STANDARD_LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 const HEX_UPPER: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
@@ -217,7 +219,13 @@ pub fn encode<const EXTENDED_HEX: bool, const PADDED: bool, const UPPERCASE: boo
     let required = encoded_len::<PADDED>(input.len()).expect("encoded length overflow");
     assert!(output.len() >= required, "output buffer too small");
 
-    let (input_index, output_index) = arch::encode::<EXTENDED_HEX, UPPERCASE>(input, output);
+    let (input_index, output_index) = match arch::encode::<EXTENDED_HEX, UPPERCASE>(input, output) {
+        Some(progress) => progress,
+        None if input.len() >= SCALAR_BULK_QUANTA * 5 => {
+            return encode_scalar_bulk::<EXTENDED_HEX, PADDED, UPPERCASE>(input, output);
+        }
+        None => (0, 0),
+    };
     encode_scalar_from::<EXTENDED_HEX, PADDED, UPPERCASE>(input, output, input_index, output_index)
 }
 
@@ -251,8 +259,16 @@ pub fn decode_with_plan<
     assert!(output.len() >= plan.required, "output buffer too small");
     let out = &mut output[..plan.required];
 
-    let (input_index, output_index) =
-        arch::decode::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(&input[..plan.complete_len], out);
+    let (input_index, output_index) = match arch::decode::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(
+        &input[..plan.complete_len],
+        out,
+    ) {
+        Some(progress) => progress,
+        None if plan.complete_len >= SCALAR_BULK_QUANTA * 8 => {
+            return decode_scalar_bulk::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(input, plan, out);
+        }
+        None => (0, 0),
+    };
     decode_from::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(
         input,
         out,
@@ -382,6 +398,26 @@ fn encode_quantum_5(alphabet: &[u8; 32], b: &[u8; 5]) -> [u8; 8] {
     ]
 }
 
+#[inline(never)]
+fn encode_scalar_bulk<const EXTENDED_HEX: bool, const PADDED: bool, const UPPERCASE: bool>(
+    input: &[u8],
+    output: &mut [MaybeUninit<u8>],
+) -> usize {
+    let alphabet = select_alphabet::<EXTENDED_HEX, UPPERCASE>();
+    let (quanta, _) = input.as_chunks::<5>();
+    let complete_output_len = quanta.len() * 8;
+    let complete_output = &mut output[..complete_output_len];
+    for (src, dst) in quanta.iter().zip(complete_output.as_chunks_mut::<8>().0) {
+        backend::write_bytes(dst, encode_quantum_5(alphabet, src));
+    }
+    encode_scalar_from::<EXTENDED_HEX, PADDED, UPPERCASE>(
+        input,
+        output,
+        quanta.len() * 5,
+        complete_output_len,
+    )
+}
+
 fn encode_scalar_from<const EXTENDED_HEX: bool, const PADDED: bool, const UPPERCASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
@@ -474,6 +510,36 @@ fn decode_chunk_8(lut: &[u8; 256], s: &[u8; 8]) -> Option<[u8; 5]> {
         | u64::from(v7);
     let [b0, b1, b2, b3] = ((packed >> 8) as u32).to_be_bytes();
     Some([b0, b1, b2, b3, packed as u8])
+}
+
+#[inline(never)]
+fn decode_scalar_bulk<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STRICT_CASE: bool>(
+    input: &[u8],
+    plan: DecodePlan,
+    output: &mut [MaybeUninit<u8>],
+) -> Result<usize, DecodeError> {
+    let lut = select_decode_lut::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>();
+    let (quanta, _) = input[..plan.complete_len].as_chunks::<8>();
+    let complete_output_len = quanta.len() * 5;
+    let complete_output = &mut output[..complete_output_len];
+    for (chunk_index, (src, dst)) in quanta
+        .iter()
+        .zip(complete_output.as_chunks_mut::<5>().0)
+        .enumerate()
+    {
+        let Some(decoded) = decode_chunk_8(lut, src) else {
+            return Err(find_invalid_in_quantum(src, chunk_index * 8, lut));
+        };
+        backend::write_bytes(dst, decoded);
+    }
+    decode_from::<EXTENDED_HEX, UPPERCASE, STRICT_CASE>(
+        input,
+        output,
+        plan.data_len,
+        plan.complete_len,
+        plan.complete_len,
+        complete_output_len,
+    )
 }
 
 fn decode_scalar_complete_from<
