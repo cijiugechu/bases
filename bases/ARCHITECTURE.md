@@ -18,10 +18,14 @@ Each profile maps at compile time to private backend dispatch functions that pai
 - `x86` and `x86_64` AVX2 and SSSE3 for Base16, Base32, and Base64, using runtime `is_x86_feature_detected!` dispatch under `std` or compile-time `target_feature` selection in `no_std`.
 - `wasm32` `simd128` (`target_feature = "simd128"`) for Base16 and Base64.
 
-SIMD backends process aligned bulk prefixes and fall back to the scalar reference implementations for tails and under `cfg!(miri)`. Callers cannot select or observe a backend, and every SIMD kernel preserves exact scalar output, error precedence, error byte offsets, and stream-state contracts. While the workspace denies `unsafe_code`, private `backend/*/arch` modules carry scoped `#[allow(unsafe_code)]` with `missing_safety_doc` and `undocumented_unsafe_blocks` enforced.
+SIMD backends process bulk prefixes and fall back to the scalar reference implementations for tails and under `cfg!(miri)`. Backend selection is private, and every SIMD kernel preserves exact scalar output, error precedence, error byte offsets, and stream-state contracts.
+
+The workspace denies `unsafe_code` by default. Scoped allowances cover architecture intrinsics and internal buffer operations, including writing into uninitialized storage and converting initialized ASCII bytes to strings. These operations document their safety invariants, with `missing_safety_doc` and `undocumented_unsafe_blocks` enforced.
 
 ## Performance contract
 
 The primary API writes into caller-owned slices, arrays, or in-place mutable buffers without allocating. Sizing methods let callers reuse exact encoding buffers and safe upper-bound decoding buffers. Successful stream updates consume the complete input slice; failures leave stream state unchanged so callers can retry with more output capacity.
+
+Owned, appended, and fixed-array results are written directly into their destination storage. Only initialized output is exposed to callers; spare capacity does not require zeroing or a second copy. Formatting encodes complete input quanta into a bounded scratch buffer before writing to the formatter.
 
 In-place decoding (`decode_in_place`) writes the decoded prefix back over the encoded buffer and leaves buffer contents unspecified on `DecodeError`. Constant-time execution and in-place encoding are not provided.
