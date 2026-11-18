@@ -47,8 +47,10 @@ use crate::io::DecoderReader;
 use crate::io::EncoderWriter;
 use crate::policy;
 use crate::policy::sealed::DecodeCasePolicy;
+use crate::policy::sealed::DecodePadding;
 use crate::policy::sealed::LetterCase;
 use crate::policy::sealed::PaddingPolicy;
+use crate::policy::sealed::profile_name;
 #[cfg(feature = "serde")]
 use crate::serde;
 
@@ -80,7 +82,8 @@ pub(crate) mod sealed {
 /// [`Standard`]), padding policy (`Padding`, defaulting to
 /// [`policy::Padded`]), encoded letter case (`Case`, defaulting to
 /// [`policy::Upper`]), and decoding case policy (`DecodeCase`, defaulting to
-/// [`policy::Strict`]).
+/// [`policy::Strict`]). Use [`policy::PaddedOptional`] or [`policy::UnpaddedOptional`] to accept
+/// both input forms while emitting padded or unpadded output, respectively.
 pub struct Base32<
     Alphabet = Standard,
     Padding = policy::Padded,
@@ -144,28 +147,15 @@ where
     #[must_use]
     #[inline]
     pub const fn name() -> &'static str {
-        match (
-            Alphabet::EXTENDED_HEX,
-            Padding::PADDED,
-            Case::UPPERCASE,
-            DecodeCase::STRICT,
-        ) {
-            (false, true, true, true) => "base32",
-            (false, false, true, true) => "base32-unpadded",
-            (false, true, false, true) => "base32-lower",
-            (false, false, false, true) => "base32-lower-unpadded",
-            (false, true, true, false) => "base32-mixed",
-            (false, false, true, false) => "base32-mixed-unpadded",
-            (false, true, false, false) => "base32-lower-mixed",
-            (false, false, false, false) => "base32-lower-mixed-unpadded",
-            (true, true, true, true) => "base32hex",
-            (true, false, true, true) => "base32hex-unpadded",
-            (true, true, false, true) => "base32hex-lower",
-            (true, false, false, true) => "base32hex-lower-unpadded",
-            (true, true, true, false) => "base32hex-mixed",
-            (true, false, true, false) => "base32hex-mixed-unpadded",
-            (true, true, false, false) => "base32hex-lower-mixed",
-            (true, false, false, false) => "base32hex-lower-mixed-unpadded",
+        match (Alphabet::EXTENDED_HEX, Case::UPPERCASE, DecodeCase::STRICT) {
+            (false, true, true) => profile_name!("base32", Padding),
+            (false, false, true) => profile_name!("base32-lower", Padding),
+            (false, true, false) => profile_name!("base32-mixed", Padding),
+            (false, false, false) => profile_name!("base32-lower-mixed", Padding),
+            (true, true, true) => profile_name!("base32hex", Padding),
+            (true, false, true) => profile_name!("base32hex-lower", Padding),
+            (true, true, false) => profile_name!("base32hex-mixed", Padding),
+            (true, false, false) => profile_name!("base32hex-lower-mixed", Padding),
         }
     }
 
@@ -178,7 +168,7 @@ where
     /// that a buffer of that size can be allocated.
     #[inline]
     pub const fn encoded_len(input_len: usize) -> Result<usize, EncodeError> {
-        let len = if Padding::PADDED {
+        let len = if Padding::ENCODE_PADDED {
             backend::base32::encoded_len::<true>(input_len)
         } else {
             backend::base32::encoded_len::<false>(input_len)
@@ -413,11 +403,11 @@ where
     const NAME: &'static str = Self::name();
     const INPUT_QUANTUM: usize = 5;
     const ENCODED_QUANTUM: usize = 8;
-    const PADDED: bool = Padding::PADDED;
+    const DECODE_PADDING: DecodePadding = Padding::DECODE_PADDING;
 
     #[inline]
     fn encoded_len_impl(input_len: usize) -> Option<usize> {
-        if Padding::PADDED {
+        if Padding::ENCODE_PADDED {
             backend::base32::encoded_len::<true>(input_len)
         } else {
             backend::base32::encoded_len::<false>(input_len)
@@ -431,7 +421,7 @@ where
 
     #[inline]
     fn decode_plan_impl(input: &[u8]) -> Result<DecodePlan, DecodeError> {
-        if Padding::PADDED {
+        if Padding::DECODE_PADDING.uses_padded_decoder(input) {
             backend::base32::decode_plan::<true>(input)
         } else {
             backend::base32::decode_plan::<false>(input)
@@ -440,7 +430,11 @@ where
 
     #[inline]
     fn encode_impl(input: &[u8], output: &mut [MaybeUninit<u8>]) -> usize {
-        match (Alphabet::EXTENDED_HEX, Padding::PADDED, Case::UPPERCASE) {
+        match (
+            Alphabet::EXTENDED_HEX,
+            Padding::ENCODE_PADDED,
+            Case::UPPERCASE,
+        ) {
             (false, false, false) => backend::base32::encode::<false, false, false>(input, output),
             (false, false, true) => backend::base32::encode::<false, false, true>(input, output),
             (false, true, false) => backend::base32::encode::<false, true, false>(input, output),
@@ -533,7 +527,7 @@ where
     fn decode_in_place_impl(buf: &mut [u8]) -> Result<usize, DecodeError> {
         match (
             Alphabet::EXTENDED_HEX,
-            Padding::PADDED,
+            Padding::DECODE_PADDING.uses_padded_decoder(buf),
             Case::UPPERCASE,
             DecodeCase::STRICT,
         ) {
