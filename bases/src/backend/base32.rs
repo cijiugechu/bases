@@ -943,6 +943,31 @@ mod tests {
         check_roundtrip_and_arch_parity::<true, false, false, false>();
     }
 
+    #[test]
+    fn scalar_bulk_reports_global_error_offsets() {
+        // 32 complete quanta followed by the RFC 4648 encoding of "f".
+        let mut input = [b'A'; 264];
+        input[256..].copy_from_slice(b"MY======");
+        let plan = decode_plan::<true>(&input).unwrap();
+        let mut output = [MaybeUninit::uninit(); 161];
+
+        input[255] = b'!';
+        assert_eq!(
+            decode_scalar_bulk::<false, true, true>(&input, plan, &mut output),
+            Err(DecodeError::InvalidByte {
+                index: 255,
+                byte: b'!',
+            })
+        );
+
+        input[255] = b'A';
+        input[257] = b'Z';
+        assert_eq!(
+            decode_scalar_bulk::<false, true, true>(&input, plan, &mut output),
+            Err(DecodeError::NonCanonical { index: 257 })
+        );
+    }
+
     fn verify_all_bytes_at_offsets<
         const EXTENDED_HEX: bool,
         const PADDED: bool,
