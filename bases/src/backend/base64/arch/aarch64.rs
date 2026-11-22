@@ -78,24 +78,8 @@ pub fn encode<const URL_SAFE_ALPHABET: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize) {
-    let chunks_12 = (input.len() / 12).min(output.len() / 16);
-    if chunks_12 == 0 {
-        return (0, 0);
-    }
-
-    let consumed_in = chunks_12 * 12;
-    let consumed_out = chunks_12 * 16;
-    // SAFETY: `consumed_in <= input.len()`, `consumed_out <= output.len()`, `MaybeUninit<u8>` has
-    // the same layout as `u8`, and NEON is baseline.
-    unsafe {
-        encode_neon::<URL_SAFE_ALPHABET>(
-            input.as_ptr(),
-            output.as_mut_ptr().cast::<u8>(),
-            consumed_in,
-            input.len(),
-        );
-    }
-    (consumed_in, consumed_out)
+    // SAFETY: `target_feature = "neon"` is enabled at compile time for this module.
+    unsafe { encode_neon::<URL_SAFE_ALPHABET>(input, output) }
 }
 
 #[inline]
@@ -143,6 +127,20 @@ pub fn decode_in_place<const URL_SAFE_ALPHABET: bool>(
     (done_16 * 16, done_16 * 12, had_invalid)
 }
 
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_16(bytes: &[u8; 16]) -> uint8x16_t {
+    // SAFETY: `bytes` contains 16 initialized readable bytes.
+    unsafe { vld1q_u8(bytes.as_ptr()) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_16_i8(bytes: &[i8; 16]) -> int8x16_t {
+    // SAFETY: `bytes` contains 16 initialized readable bytes.
+    unsafe { vld1q_s8(bytes.as_ptr()) }
+}
+
 /// # Safety
 ///
 /// Caller must ensure `in_ptr` is valid for `rem_total_in >= 12` reads and NEON is enabled.
@@ -180,37 +178,41 @@ unsafe fn store_12_neon(out_ptr: *mut u8, packed: uint8x16_t) {
     }
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for `rem_total_in >= rem_in` reads (`rem_in` a multiple of
-/// 12) and `out_ptr` is valid for `(rem_in / 12) * 16` non-overlapping writes, with NEON enabled.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn encode_neon<const URL_SAFE_ALPHABET: bool>(
-    mut in_ptr: *const u8,
-    mut out_ptr: *mut u8,
-    mut rem_in: usize,
-    mut rem_total_in: usize,
-) {
-    let alpha_ptr = if URL_SAFE_ALPHABET {
+fn encode_neon<const URL_SAFE_ALPHABET: bool>(
+    input: &[u8],
+    output: &mut [MaybeUninit<u8>],
+) -> (usize, usize) {
+    let chunks_12 = (input.len() / 12).min(output.len() / 16);
+    if chunks_12 == 0 {
+        return (0, 0);
+    }
+
+    let consumed_in = chunks_12 * 12;
+    let consumed_out = chunks_12 * 16;
+    let alpha = if URL_SAFE_ALPHABET {
         URL_SAFE
     } else {
         STANDARD
     }
-    .as_ptr();
-    // SAFETY: `alpha_ptr` points to a 64-byte static alphabet table.
-    let alphabet_tbl = unsafe {
-        uint8x16x4_t(
-            vld1q_u8(alpha_ptr),
-            vld1q_u8(alpha_ptr.add(16)),
-            vld1q_u8(alpha_ptr.add(32)),
-            vld1q_u8(alpha_ptr.add(48)),
-        )
-    };
+    .as_chunks::<16>()
+    .0;
+    let alphabet_tbl = uint8x16x4_t(
+        load_16(&alpha[0]),
+        load_16(&alpha[1]),
+        load_16(&alpha[2]),
+        load_16(&alpha[3]),
+    );
     let mask_3f = vdupq_n_u8(0x3f);
 
+    let mut in_ptr = input.as_ptr();
+    let mut out_ptr = output.as_mut_ptr().cast::<u8>();
+    let mut rem_in = consumed_in;
+    let mut rem_total_in = input.len();
+
     while rem_in >= 48 {
-        // SAFETY: `rem_in >= 48` guarantees 48 readable bytes at `in_ptr`.
+        // SAFETY: `rem_in <= consumed_in <= input.len()` guarantees 48 readable bytes at `in_ptr`.
         let uint8x16x3_t(b0, b1, b2) = unsafe { vld3q_u8(in_ptr) };
         let idx0 = vshrq_n_u8::<2>(b0);
         let idx1 = vandq_u8(vorrq_u8(vshlq_n_u8::<4>(b0), vshrq_n_u8::<4>(b1)), mask_3f);
@@ -234,15 +236,10 @@ unsafe fn encode_neon<const URL_SAFE_ALPHABET: bool>(
     }
 
     if rem_in >= 12 {
-        // SAFETY: All four pointers reference 16-byte static constant tables.
-        let (shuf_a, shl_a, shuf_b, shr_b) = unsafe {
-            (
-                vld1q_u8(ENC_SHUF_A.as_ptr()),
-                vld1q_s8(ENC_SHL_A.as_ptr()),
-                vld1q_u8(ENC_SHUF_B.as_ptr()),
-                vld1q_s8(ENC_SHR_B.as_ptr()),
-            )
-        };
+        let shuf_a = load_16(&ENC_SHUF_A);
+        let shl_a = load_16_i8(&ENC_SHL_A);
+        let shuf_b = load_16(&ENC_SHUF_B);
+        let shr_b = load_16_i8(&ENC_SHR_B);
 
         while rem_in >= 12 {
             // SAFETY: `rem_total_in >= rem_in >= 12` guarantees enough readable bytes at `in_ptr`.
@@ -263,6 +260,8 @@ unsafe fn encode_neon<const URL_SAFE_ALPHABET: bool>(
             rem_total_in -= 12;
         }
     }
+
+    (consumed_in, consumed_out)
 }
 
 /// # Safety
@@ -280,32 +279,22 @@ unsafe fn decode_neon<const URL_SAFE_ALPHABET: bool>(
     limit_16: usize,
     out_len: usize,
 ) -> (usize, bool) {
-    let lo_mask_ptr = if URL_SAFE_ALPHABET {
+    let hi_mask_tbl = load_16(&HI_MASK);
+    let lo_mask_tbl = load_16(if URL_SAFE_ALPHABET {
         &LO_MASK_URL
     } else {
         &LO_MASK_STD
-    }
-    .as_ptr();
-    let roll_ptr = if URL_SAFE_ALPHABET {
+    });
+    let roll_tbl = load_16(if URL_SAFE_ALPHABET {
         &ROLL_URL
     } else {
         &ROLL_STD
-    }
-    .as_ptr();
-    let wide_16 = (out_len.saturating_sub(4) / 12).min(limit_16);
-    let mut done_16 = 0;
-
-    // SAFETY: All three pointers reference 16-byte static lookup tables.
-    let (hi_mask_tbl, lo_mask_tbl, roll_tbl) = unsafe {
-        (
-            vld1q_u8(HI_MASK.as_ptr()),
-            vld1q_u8(lo_mask_ptr),
-            vld1q_u8(roll_ptr),
-        )
-    };
+    });
     let mask_0f = vdupq_n_u8(0x0f);
     let special_ch = vdupq_n_u8(if URL_SAFE_ALPHABET { b'_' } else { b'/' });
     let special_adj = vdupq_n_u8(if URL_SAFE_ALPHABET { 33 } else { 3 });
+    let wide_16 = (out_len.saturating_sub(4) / 12).min(limit_16);
+    let mut done_16 = 0;
 
     let limit_64_as_16 = (limit_16 / 4) * 4;
     while done_16 < limit_64_as_16 {
@@ -337,14 +326,9 @@ unsafe fn decode_neon<const URL_SAFE_ALPHABET: bool>(
     }
 
     if done_16 < limit_16 {
-        // SAFETY: All three pointers reference 16-byte static constant tables.
-        let (dec_shl, dec_shr, dec_pack) = unsafe {
-            (
-                vld1q_s8(DEC_SHL.as_ptr()),
-                vld1q_s8(DEC_SHR.as_ptr()),
-                vld1q_u8(DEC_PACK.as_ptr()),
-            )
-        };
+        let dec_shl = load_16_i8(&DEC_SHL);
+        let dec_shr = load_16_i8(&DEC_SHR);
+        let dec_pack = load_16(&DEC_PACK);
 
         while done_16 < limit_16 {
             // SAFETY: `done_16 < limit_16` guarantees 16 readable bytes at `in_ptr`.
@@ -363,18 +347,15 @@ unsafe fn decode_neon<const URL_SAFE_ALPHABET: bool>(
             ) else {
                 return (done_16, true);
             };
-            if done_16 < wide_16 {
-                // SAFETY: `done_16 < wide_16` guarantees `done_16 * 12 + 16 <= out_len`, and
-                // in-place writes lag behind `in_ptr`.
-                unsafe { vst1q_u8(out_ptr, packed) };
-            } else {
-                // SAFETY: `done_16 < limit_16` guarantees 12 writable bytes at `out_ptr`, and this
-                // chunk's input was already loaded so in-place writes do not overwrite unread
-                // input.
-                unsafe { store_12_neon(out_ptr, packed) };
-            }
-            // SAFETY: Advancing by 16 and 12 bytes stays within the caller-guaranteed buffers.
+            // SAFETY: `done_16 < limit_16` guarantees 12 writable bytes at `out_ptr` (and 16 when
+            // `done_16 < wide_16`), this chunk's input was already loaded, and advancing by 16 and
+            // 12 bytes stays within both buffers.
             unsafe {
+                if done_16 < wide_16 {
+                    vst1q_u8(out_ptr, packed);
+                } else {
+                    store_12_neon(out_ptr, packed);
+                }
                 in_ptr = in_ptr.add(16);
                 out_ptr = out_ptr.add(12);
             }

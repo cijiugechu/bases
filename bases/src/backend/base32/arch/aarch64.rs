@@ -81,22 +81,8 @@ pub fn encode<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     input: &[u8],
     output: &mut [MaybeUninit<u8>],
 ) -> (usize, usize) {
-    let chunks = (input.len() / 10).min(output.len() / 16);
-    if chunks == 0 {
-        return (0, 0);
-    }
-
-    // SAFETY: `input.len() >= chunks * 10`, `output.len() >= chunks * 16`,
-    // `MaybeUninit<u8>` has the same layout as `u8`, and NEON is baseline on aarch64.
-    unsafe {
-        encode_neon::<EXTENDED_HEX, UPPERCASE>(
-            input.as_ptr(),
-            output.as_mut_ptr().cast::<u8>(),
-            chunks,
-            input.len(),
-        );
-    }
-    (chunks * 10, chunks * 16)
+    // SAFETY: `target_feature = "neon"` is enabled at compile time for this module.
+    unsafe { encode_neon::<EXTENDED_HEX, UPPERCASE>(input, output) }
 }
 
 #[inline]
@@ -145,36 +131,48 @@ pub fn decode_in_place<const EXTENDED_HEX: bool, const UPPERCASE: bool, const ST
     (done * 16, done * 10)
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for `input_len >= chunks * 10` reads (`chunks > 0`) and
-/// `out_ptr` is valid for `chunks * 16` non-overlapping writes, with NEON enabled.
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn encode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
-    mut in_ptr: *const u8,
-    mut out_ptr: *mut u8,
-    chunks: usize,
-    input_len: usize,
-) {
-    let alpha_ptr = select_alphabet::<EXTENDED_HEX, UPPERCASE>().as_ptr();
-    // SAFETY: `alpha_ptr` points to 32 bytes and the remaining pointers reference 16-byte static
-    // constant arrays.
-    let (alphabet_tbl, w_shuf, even_shifts, odd_shifts) = unsafe {
-        (
-            uint8x16x2_t(vld1q_u8(alpha_ptr), vld1q_u8(alpha_ptr.add(16))),
-            vld1q_u8(W_SHUF.as_ptr()),
-            vld1q_s16(EVEN_SHIFTS.as_ptr()),
-            vld1q_s16(ODD_SHIFTS.as_ptr()),
-        )
-    };
-    let wide_chunks = ((input_len - 6) / 10).min(chunks);
+fn load_16(bytes: &[u8; 16]) -> uint8x16_t {
+    // SAFETY: `bytes` contains 16 initialized readable bytes.
+    unsafe { vld1q_u8(bytes.as_ptr()) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn load_8_i16(words: &[i16; 8]) -> int16x8_t {
+    // SAFETY: `words` contains 8 initialized readable `i16` lanes.
+    unsafe { vld1q_s16(words.as_ptr()) }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn encode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
+    input: &[u8],
+    output: &mut [MaybeUninit<u8>],
+) -> (usize, usize) {
+    let chunks = (input.len() / 10).min(output.len() / 16);
+    if chunks == 0 {
+        return (0, 0);
+    }
+
+    let alpha = select_alphabet::<EXTENDED_HEX, UPPERCASE>()
+        .as_chunks::<16>()
+        .0;
+    let alphabet_tbl = uint8x16x2_t(load_16(&alpha[0]), load_16(&alpha[1]));
+    let w_shuf = load_16(&W_SHUF);
+    let even_shifts = load_8_i16(&EVEN_SHIFTS);
+    let odd_shifts = load_8_i16(&ODD_SHIFTS);
+
+    let mut in_ptr = input.as_ptr();
+    let mut out_ptr = output.as_mut_ptr().cast::<u8>();
+    let wide_chunks = ((input.len() - 6) / 10).min(chunks);
     for _ in 0..wide_chunks {
         // SAFETY: `wide_chunks` guarantees 16 readable bytes at `in_ptr`.
         let raw = unsafe { vld1q_u8(in_ptr) };
         let ascii = encode_chunk_neon(raw, alphabet_tbl, w_shuf, even_shifts, odd_shifts);
-        // SAFETY: Caller guarantees `chunks * 16` writable bytes at `out_ptr`, and advancing by 10
-        // and 16 bytes stays within both buffers.
+        // SAFETY: `chunks * 16 <= output.len()` guarantees 16 writable bytes at `out_ptr`, and
+        // advancing by 10 and 16 bytes stays within both buffers.
         unsafe {
             vst1q_u8(out_ptr, ascii);
             in_ptr = in_ptr.add(10);
@@ -183,7 +181,7 @@ unsafe fn encode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
     }
     if wide_chunks < chunks {
         // The last two quanta need only ten readable bytes, even at an allocation boundary.
-        // SAFETY: Caller guarantees at least 10 remaining readable bytes at `in_ptr`.
+        // SAFETY: `chunks * 10 <= input.len()` guarantees 10 remaining readable bytes at `in_ptr`.
         let (low, high) = unsafe {
             (
                 ptr::read_unaligned(in_ptr.cast::<u64>()),
@@ -192,9 +190,11 @@ unsafe fn encode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool>(
         };
         let raw = vreinterpretq_u8_u64(vsetq_lane_u64::<1>(high, vdupq_n_u64(low)));
         let ascii = encode_chunk_neon(raw, alphabet_tbl, w_shuf, even_shifts, odd_shifts);
-        // SAFETY: Caller guarantees 16 remaining writable bytes at `out_ptr`.
+        // SAFETY: `chunks * 16 <= output.len()` guarantees 16 remaining writable bytes at
+        // `out_ptr`.
         unsafe { vst1q_u8(out_ptr, ascii) };
     }
+    (chunks * 10, chunks * 16)
 }
 
 #[inline]
@@ -228,29 +228,19 @@ unsafe fn decode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STR
     chunks: usize,
     out_len: usize,
 ) -> usize {
-    let hi_mask_ptr = select_hi_mask::<UPPERCASE, STRICT_CASE>().as_ptr();
-    let lo_mask_ptr = if EXTENDED_HEX {
+    let hi_mask_tbl = load_16(select_hi_mask::<UPPERCASE, STRICT_CASE>());
+    let lo_mask_tbl = load_16(if EXTENDED_HEX {
         &LO_MASK_HEX
     } else {
         &LO_MASK_STD
-    }
-    .as_ptr();
-    let roll_ptr = if EXTENDED_HEX { &ROLL_HEX } else { &ROLL_STD }.as_ptr();
-    let wide_chunks = (out_len.saturating_sub(6) / 10).min(chunks);
-    let mut done = 0;
-
-    // SAFETY: All four pointers reference 16-byte static lookup tables.
-    let (hi_mask_tbl, lo_mask_tbl, roll_tbl, pack_shuf) = unsafe {
-        (
-            vld1q_u8(hi_mask_ptr),
-            vld1q_u8(lo_mask_ptr),
-            vld1q_u8(roll_ptr),
-            vld1q_u8(PACK_SHUF.as_ptr()),
-        )
-    };
+    });
+    let roll_tbl = load_16(if EXTENDED_HEX { &ROLL_HEX } else { &ROLL_STD });
+    let pack_shuf = load_16(&PACK_SHUF);
     let mask_0f = vdupq_n_u8(0x0f);
     let mask_001f = vdupq_n_u16(0x001f);
     let mask_03ff = vdupq_n_u32(0x03ff);
+    let wide_chunks = (out_len.saturating_sub(6) / 10).min(chunks);
+    let mut done = 0;
 
     while done + 2 <= wide_chunks {
         // SAFETY: `done + 2 <= wide_chunks <= chunks` guarantees 32 readable bytes at `in_ptr`.
@@ -282,22 +272,18 @@ unsafe fn decode_neon<const EXTENDED_HEX: bool, const UPPERCASE: bool, const STR
             return done;
         }
         let res = pack_chunk_16_neon(v, hi, roll_tbl, pack_shuf, mask_001f, mask_03ff);
-        if done < wide_chunks {
-            // SAFETY: `done < wide_chunks` guarantees `done * 10 + 16 <= out_len`, and in-place
-            // writes lag behind `in_ptr`.
-            unsafe { vst1q_u8(out_ptr, res) };
-        } else {
-            let lo = vget_low_u8(res);
-            let hi16 = vgetq_lane_u16::<4>(vreinterpretq_u16_u8(res));
-            // SAFETY: `done < chunks` guarantees 10 writable bytes at `out_ptr`, and this chunk's
-            // input was already loaded so in-place writes do not overwrite unread input.
-            unsafe {
+        let lo = vget_low_u8(res);
+        let hi16 = vgetq_lane_u16::<4>(vreinterpretq_u16_u8(res));
+        // SAFETY: `done < chunks` guarantees 10 writable bytes at `out_ptr` (and 16 when `done <
+        // wide_chunks`), this chunk's input was already loaded, and advancing by 16 and 10 bytes
+        // stays within both buffers.
+        unsafe {
+            if done < wide_chunks {
+                vst1q_u8(out_ptr, res);
+            } else {
                 vst1_u8(out_ptr, lo);
                 ptr::write_unaligned(out_ptr.add(8).cast::<u16>(), hi16);
             }
-        }
-        // SAFETY: Advancing by 16 and 10 bytes stays within the caller-guaranteed buffers.
-        unsafe {
             in_ptr = in_ptr.add(16);
             out_ptr = out_ptr.add(10);
         }

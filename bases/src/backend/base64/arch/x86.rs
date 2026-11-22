@@ -98,12 +98,9 @@ use x86_arch::_mm256_sub_epi8;
 #[cfg(any(feature = "std", target_feature = "avx2"))]
 use x86_arch::_mm256_subs_epu8;
 
-const LO_MASK_STD: [i8; 16] = [
-    0x1a, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1c, 0x05, 0x04, 0x04, 0x04, 0x05,
-];
-const LO_MASK_URL: [i8; 16] = [
-    0x1a, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1e, 0x1c, 0x04, 0x04, 0x05, 0x04, 0x0c,
-];
+use crate::backend::base64::HI_MASK;
+use crate::backend::base64::LO_MASK_STD;
+use crate::backend::base64::LO_MASK_URL;
 
 const ROLL_STD: [i8; 16] = [0, 0, 19, 4, -65, -65, -71, -71, 0, 0, 0, 0, 0, 0, 0, 0];
 const ROLL_URL: [i8; 16] = [0, 0, 17, 4, -65, -65, -71, -71, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -259,6 +256,20 @@ pub fn decode_in_place<const URL_SAFE_ALPHABET: bool>(
 
 #[inline]
 #[target_feature(enable = "ssse3")]
+fn load_16(bytes: &[u8; 16]) -> __m128i {
+    // SAFETY: `bytes` contains 16 initialized readable bytes.
+    unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
+fn load_16_i8(bytes: &[i8; 16]) -> __m128i {
+    // SAFETY: `bytes` contains 16 initialized readable bytes.
+    unsafe { _mm_loadu_si128(bytes.as_ptr().cast()) }
+}
+
+#[inline]
+#[target_feature(enable = "ssse3")]
 fn encode_128_consts<const URL_SAFE_ALPHABET: bool>() -> (
     __m128i,
     __m128i,
@@ -288,16 +299,11 @@ fn encode_128_consts<const URL_SAFE_ALPHABET: bool>() -> (
     (shuf, mask0, mul0, mask1, mul1, c51, c25, offset_lut)
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 16 reads and `out_ptr` for 16 writes, with SSSE3
-/// enabled.
 #[inline]
 #[target_feature(enable = "ssse3")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn encode_chunk_12(
-    in_ptr: *const u8,
-    out_ptr: *mut u8,
+fn encode_chunk_12(
+    raw: __m128i,
     shuf: __m128i,
     mask0: __m128i,
     mul0: __m128i,
@@ -306,9 +312,7 @@ unsafe fn encode_chunk_12(
     c51: __m128i,
     c25: __m128i,
     offset_lut: __m128i,
-) {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 16 readable bytes.
-    let raw = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+) -> __m128i {
     let w = _mm_shuffle_epi8(raw, shuf);
     let t0 = _mm_mulhi_epu16(_mm_and_si128(w, mask0), mul0);
     let t1 = _mm_mullo_epi16(_mm_and_si128(w, mask1), mul1);
@@ -316,9 +320,7 @@ unsafe fn encode_chunk_12(
     let result = _mm_subs_epu8(indices, c51);
     // Map A-Z to slot 0, a-z to slot 1, and the remaining symbols to slots 2-13.
     let key = _mm_sub_epi8(result, _mm_cmpgt_epi8(indices, c25));
-    let ascii = _mm_add_epi8(indices, _mm_shuffle_epi8(offset_lut, key));
-    // SAFETY: Caller guarantees `out_ptr` is valid for 16 writes.
-    unsafe { _mm_storeu_si128(out_ptr.cast(), ascii) };
+    _mm_add_epi8(indices, _mm_shuffle_epi8(offset_lut, key))
 }
 
 #[cfg(not(target_feature = "avx2"))]
@@ -340,13 +342,13 @@ fn encode_ssse3<const URL_SAFE_ALPHABET: bool>(
     let (shuf, mask0, mul0, mask1, mul1, c51, c25, offset_lut) =
         encode_128_consts::<URL_SAFE_ALPHABET>();
     for _ in 0..chunks {
-        // SAFETY: `chunks > 0` implies `input.len() >= (chunks - 1) * 12 + 16` and
-        // `output.len() >= chunks * 16`, so each iteration reads 16 bytes, writes 16 bytes, and
-        // stays in bounds.
+        // SAFETY: `chunks > 0` implies `input.len() >= (chunks - 1) * 12 + 16`.
+        let raw = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+        let ascii = encode_chunk_12(raw, shuf, mask0, mul0, mask1, mul1, c51, c25, offset_lut);
+        // SAFETY: `output.len() >= chunks * 16`, so `out_ptr` is valid for 16 writes and
+        // advancing both pointers stays in bounds.
         unsafe {
-            encode_chunk_12(
-                in_ptr, out_ptr, shuf, mask0, mul0, mask1, mul1, c51, c25, offset_lut,
-            );
+            _mm_storeu_si128(out_ptr.cast(), ascii);
             in_ptr = in_ptr.add(12);
             out_ptr = out_ptr.add(16);
         }
@@ -411,22 +413,18 @@ fn encode_avx2<const URL_SAFE_ALPHABET: bool>(
     }
 
     if input_index + 16 <= input.len() && output_index + 16 <= output.len() {
-        // SAFETY: The guard above ensures `input_index` and `output_index` are in bounds with 16
-        // readable input bytes and 16 writable output bytes, and AVX2 implies SSSE3.
+        // SAFETY: The guard above ensures `input_index + 16 <= input.len()`.
+        let raw = unsafe { _mm_loadu_si128(input.as_ptr().add(input_index).cast()) };
+        let ascii = encode_chunk_12(
+            raw, sh_128, m0_128, ml0_128, m1_128, ml1_128, c51_128, c25_128, lut_128,
+        );
+        // SAFETY: The guard above ensures `output_index + 16 <= output.len()`.
         unsafe {
-            encode_chunk_12(
-                input.as_ptr().add(input_index),
-                output.as_mut_ptr().cast::<u8>().add(output_index),
-                sh_128,
-                m0_128,
-                ml0_128,
-                m1_128,
-                ml1_128,
-                c51_128,
-                c25_128,
-                lut_128,
-            );
-        }
+            _mm_storeu_si128(
+                output.as_mut_ptr().cast::<u8>().add(output_index).cast(),
+                ascii,
+            )
+        };
         input_index += 12;
         output_index += 16;
     }
@@ -438,25 +436,17 @@ fn encode_avx2<const URL_SAFE_ALPHABET: bool>(
 #[target_feature(enable = "ssse3")]
 fn decode_128_tables<const URL_SAFE_ALPHABET: bool>()
 -> (__m128i, __m128i, __m128i, __m128i, __m128i, __m128i) {
-    let hi_mask = _mm_setr_epi8(0, 0, 1, 2, 4, 8, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0);
-    let lo = if URL_SAFE_ALPHABET {
-        LO_MASK_URL
+    let hi_mask = load_16(&HI_MASK);
+    let lo_mask = load_16(if URL_SAFE_ALPHABET {
+        &LO_MASK_URL
     } else {
-        LO_MASK_STD
-    };
-    let roll = if URL_SAFE_ALPHABET {
-        ROLL_URL
+        &LO_MASK_STD
+    });
+    let roll_tbl = load_16_i8(if URL_SAFE_ALPHABET {
+        &ROLL_URL
     } else {
-        ROLL_STD
-    };
-    let lo_mask = _mm_setr_epi8(
-        lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7], lo[8], lo[9], lo[10], lo[11],
-        lo[12], lo[13], lo[14], lo[15],
-    );
-    let roll_tbl = _mm_setr_epi8(
-        roll[0], roll[1], roll[2], roll[3], roll[4], roll[5], roll[6], roll[7], roll[8], roll[9],
-        roll[10], roll[11], roll[12], roll[13], roll[14], roll[15],
-    );
+        &ROLL_STD
+    });
     let pack_shuf = _mm_setr_epi8(2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1);
     let special_ch = _mm_set1_epi8(if URL_SAFE_ALPHABET { b'_' } else { b'/' } as i8);
     let special_adj = _mm_set1_epi8(if URL_SAFE_ALPHABET { 33 } else { 3 });
@@ -470,14 +460,11 @@ fn decode_128_tables<const URL_SAFE_ALPHABET: bool>()
     )
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 16 reads and SSSE3 is enabled.
 #[inline]
 #[target_feature(enable = "ssse3")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn decode_chunk_16<const URL_SAFE_ALPHABET: bool>(
-    in_ptr: *const u8,
+fn decode_chunk_16<const URL_SAFE_ALPHABET: bool>(
+    v: __m128i,
     hi_mask: __m128i,
     lo_mask: __m128i,
     roll_tbl: __m128i,
@@ -489,8 +476,6 @@ unsafe fn decode_chunk_16<const URL_SAFE_ALPHABET: bool>(
     mul_0001_1000: __m128i,
     zero: __m128i,
 ) -> Option<__m128i> {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 16 readable bytes.
-    let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
     let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
     let lo = _mm_and_si128(v, mask_0f);
     let chk = _mm_and_si128(_mm_shuffle_epi8(hi_mask, hi), _mm_shuffle_epi8(lo_mask, lo));
@@ -550,21 +535,20 @@ unsafe fn decode_ssse3<const URL_SAFE_ALPHABET: bool>(
 
     while done < wide_chunks {
         // SAFETY: `done < wide_chunks <= chunks` guarantees 16 readable bytes at `in_ptr`.
-        let Some(res) = (unsafe {
-            decode_chunk_16::<URL_SAFE_ALPHABET>(
-                in_ptr,
-                hi_mask,
-                lo_mask,
-                roll_tbl,
-                pack_shuf,
-                special_ch,
-                special_adj,
-                mask_0f,
-                mul_0140,
-                mul_0001_1000,
-                zero,
-            )
-        }) else {
+        let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+        let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(
+            v,
+            hi_mask,
+            lo_mask,
+            roll_tbl,
+            pack_shuf,
+            special_ch,
+            special_adj,
+            mask_0f,
+            mul_0140,
+            mul_0001_1000,
+            zero,
+        ) else {
             return (done, true);
         };
         // SAFETY: `done < wide_chunks <= chunks` guarantees `done * 12 + 16 <= out_len`, in-place
@@ -580,21 +564,20 @@ unsafe fn decode_ssse3<const URL_SAFE_ALPHABET: bool>(
 
     if done < chunks {
         // SAFETY: `done < chunks` guarantees 16 readable bytes at `in_ptr`.
-        let Some(res) = (unsafe {
-            decode_chunk_16::<URL_SAFE_ALPHABET>(
-                in_ptr,
-                hi_mask,
-                lo_mask,
-                roll_tbl,
-                pack_shuf,
-                special_ch,
-                special_adj,
-                mask_0f,
-                mul_0140,
-                mul_0001_1000,
-                zero,
-            )
-        }) else {
+        let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+        let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(
+            v,
+            hi_mask,
+            lo_mask,
+            roll_tbl,
+            pack_shuf,
+            special_ch,
+            special_adj,
+            mask_0f,
+            mul_0140,
+            mul_0001_1000,
+            zero,
+        ) else {
             return (done, true);
         };
         // SAFETY: `done < chunks` guarantees 12 writable bytes at `out_ptr`, and this chunk's input
@@ -605,16 +588,14 @@ unsafe fn decode_ssse3<const URL_SAFE_ALPHABET: bool>(
     (done, false)
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 32 reads and AVX2 is enabled. Returns un-permuted
-/// lanes holding output bytes `0..12` in lane 0 and `12..24` in lane 1.
+/// Decodes 32 Base64 bytes into un-permuted lanes holding output bytes `0..12` in lane 0 and
+/// `12..24` in lane 1.
 #[cfg(any(feature = "std", target_feature = "avx2"))]
 #[inline]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn decode_chunk_32<const URL_SAFE_ALPHABET: bool>(
-    in_ptr: *const u8,
+fn decode_chunk_32<const URL_SAFE_ALPHABET: bool>(
+    v: __m256i,
     hi_mask: __m256i,
     lo_mask: __m256i,
     roll_tbl: __m256i,
@@ -626,8 +607,6 @@ unsafe fn decode_chunk_32<const URL_SAFE_ALPHABET: bool>(
     mul_0001_1000: __m256i,
     zero: __m256i,
 ) -> Option<__m256i> {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 32 readable bytes.
-    let v = unsafe { _mm256_loadu_si256(in_ptr.cast()) };
     let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
     let lo = _mm256_and_si256(v, mask_0f);
     let chk = _mm256_and_si256(
@@ -702,21 +681,20 @@ unsafe fn decode_avx2<const URL_SAFE_ALPHABET: bool>(
 
         for _ in 0..wide_32 {
             // SAFETY: `done_16 + 2 <= chunks_16` guarantees 32 readable bytes at `in_ptr`.
-            let Some(shuf) = (unsafe {
-                decode_chunk_32::<URL_SAFE_ALPHABET>(
-                    in_ptr,
-                    hi_mask,
-                    lo_mask,
-                    roll_tbl,
-                    pack_shuf,
-                    special_ch,
-                    special_adj,
-                    mask_0f,
-                    mul_0140,
-                    mul_0001_1000,
-                    zero,
-                )
-            }) else {
+            let v = unsafe { _mm256_loadu_si256(in_ptr.cast()) };
+            let Some(shuf) = decode_chunk_32::<URL_SAFE_ALPHABET>(
+                v,
+                hi_mask,
+                lo_mask,
+                roll_tbl,
+                pack_shuf,
+                special_ch,
+                special_adj,
+                mask_0f,
+                mul_0140,
+                mul_0001_1000,
+                zero,
+            ) else {
                 return (done_16, true);
             };
             let lo = _mm256_castsi256_si128(shuf);
@@ -735,21 +713,20 @@ unsafe fn decode_avx2<const URL_SAFE_ALPHABET: bool>(
 
         if wide_32 < chunks_32 {
             // SAFETY: `done_16 + 2 <= chunks_16` guarantees 32 readable bytes at `in_ptr`.
-            let Some(shuf) = (unsafe {
-                decode_chunk_32::<URL_SAFE_ALPHABET>(
-                    in_ptr,
-                    hi_mask,
-                    lo_mask,
-                    roll_tbl,
-                    pack_shuf,
-                    special_ch,
-                    special_adj,
-                    mask_0f,
-                    mul_0140,
-                    mul_0001_1000,
-                    zero,
-                )
-            }) else {
+            let v = unsafe { _mm256_loadu_si256(in_ptr.cast()) };
+            let Some(shuf) = decode_chunk_32::<URL_SAFE_ALPHABET>(
+                v,
+                hi_mask,
+                lo_mask,
+                roll_tbl,
+                pack_shuf,
+                special_ch,
+                special_adj,
+                mask_0f,
+                mul_0140,
+                mul_0001_1000,
+                zero,
+            ) else {
                 return (done_16, true);
             };
             let lane_perm = _mm256_setr_epi32(0, 1, 2, 4, 5, 6, 3, 7);
@@ -772,31 +749,30 @@ unsafe fn decode_avx2<const URL_SAFE_ALPHABET: bool>(
         let mul_0140 = _mm_set1_epi32(0x0140_0140);
         let mul_0001_1000 = _mm_set1_epi32(0x0001_1000);
         let zero = _mm_setzero_si128();
-        // SAFETY: `done_16 < chunks_16` guarantees 16 readable bytes at `in_ptr`, and AVX2 implies
-        // SSSE3.
-        if let Some(res) = unsafe {
-            decode_chunk_16::<URL_SAFE_ALPHABET>(
-                in_ptr,
-                hi_128,
-                lo_128,
-                roll_128,
-                shuf_128,
-                spec_ch_128,
-                spec_adj_128,
-                mask_0f,
-                mul_0140,
-                mul_0001_1000,
-                zero,
-            )
-        } {
-            if out_len.saturating_sub(done_16 * 12) >= 16 {
-                // SAFETY: The guard above ensures 16 writable bytes at `out_ptr`, and in-place
-                // writes lag behind `in_ptr`.
-                unsafe { _mm_storeu_si128(out_ptr.cast(), res) };
-            } else {
-                // SAFETY: `done_16 < chunks_16` guarantees 12 writable bytes at `out_ptr`, this
-                // chunk's input was already loaded, and AVX2 implies SSSE3.
-                unsafe { store_12_ssse3(out_ptr, res) };
+        // SAFETY: `done_16 < chunks_16` guarantees 16 readable bytes at `in_ptr`.
+        let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+        if let Some(res) = decode_chunk_16::<URL_SAFE_ALPHABET>(
+            v,
+            hi_128,
+            lo_128,
+            roll_128,
+            shuf_128,
+            spec_ch_128,
+            spec_adj_128,
+            mask_0f,
+            mul_0140,
+            mul_0001_1000,
+            zero,
+        ) {
+            // SAFETY: `done_16 < chunks_16` guarantees 12 writable bytes at `out_ptr` (and 16 when
+            // `out_len - done_16 * 12 >= 16`), this chunk's input was already loaded, and AVX2
+            // implies SSSE3.
+            unsafe {
+                if out_len.saturating_sub(done_16 * 12) >= 16 {
+                    _mm_storeu_si128(out_ptr.cast(), res);
+                } else {
+                    store_12_ssse3(out_ptr, res);
+                }
             }
             done_16 += 1;
         } else {

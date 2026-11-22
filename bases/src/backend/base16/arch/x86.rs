@@ -246,26 +246,17 @@ fn hex_table_128<const UPPERCASE: bool>() -> __m128i {
     }
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 16 reads and `out_ptr` for 32 writes, with SSSE3
-/// enabled.
 #[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn encode_chunk_16(in_ptr: *const u8, out_ptr: *mut u8, hex_tbl: __m128i, mask_0f: __m128i) {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 16 readable bytes.
-    let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+fn encode_chunk_16(v: __m128i, hex_tbl: __m128i, mask_0f: __m128i) -> (__m128i, __m128i) {
     let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask_0f);
     let lo = _mm_and_si128(v, mask_0f);
     let hi_ascii = _mm_shuffle_epi8(hex_tbl, hi);
     let lo_ascii = _mm_shuffle_epi8(hex_tbl, lo);
-    let out0 = _mm_unpacklo_epi8(hi_ascii, lo_ascii);
-    let out1 = _mm_unpackhi_epi8(hi_ascii, lo_ascii);
-    // SAFETY: Caller guarantees `out_ptr` is valid for 32 writes.
-    unsafe {
-        _mm_storeu_si128(out_ptr.cast(), out0);
-        _mm_storeu_si128(out_ptr.add(16).cast(), out1);
-    }
+    (
+        _mm_unpacklo_epi8(hi_ascii, lo_ascii),
+        _mm_unpackhi_epi8(hi_ascii, lo_ascii),
+    )
 }
 
 #[cfg(not(target_feature = "avx2"))]
@@ -284,10 +275,14 @@ fn encode_ssse3<const UPPERCASE: bool>(
     let hex_tbl = hex_table_128::<UPPERCASE>();
     let mask_0f = _mm_set1_epi8(0x0f);
     for _ in 0..chunks {
-        // SAFETY: `chunks * 16 <= input.len()` and `chunks * 32 <= output.len()`, so each
-        // iteration reads 16 input bytes, writes 32 output bytes, and stays in bounds.
+        // SAFETY: `chunks * 16 <= input.len()`, so `in_ptr` is valid for 16 readable bytes.
+        let v = unsafe { _mm_loadu_si128(in_ptr.cast()) };
+        let (out0, out1) = encode_chunk_16(v, hex_tbl, mask_0f);
+        // SAFETY: `chunks * 32 <= output.len()`, so `out_ptr` is valid for 32 writes and
+        // advancing both pointers stays in bounds.
         unsafe {
-            encode_chunk_16(in_ptr, out_ptr, hex_tbl, mask_0f);
+            _mm_storeu_si128(out_ptr.cast(), out0);
+            _mm_storeu_si128(out_ptr.add(16).cast(), out1);
             in_ptr = in_ptr.add(16);
             out_ptr = out_ptr.add(32);
         }
@@ -333,16 +328,14 @@ fn encode_avx2<const UPPERCASE: bool>(
         }
     }
     if input_index + 16 <= input.len() && output_index + 32 <= output.len() {
-        let mask_0f = _mm_set1_epi8(0x0f);
-        // SAFETY: The guard above ensures `input_index` and `output_index` are in bounds with 16
-        // readable input bytes and 32 writable output bytes, and AVX2 implies SSSE3.
+        // SAFETY: The guard above ensures `input_index + 16 <= input.len()`.
+        let v = unsafe { _mm_loadu_si128(input.as_ptr().add(input_index).cast()) };
+        let (out0, out1) = encode_chunk_16(v, hex_128, _mm_set1_epi8(0x0f));
+        // SAFETY: The guard above ensures `output_index + 32 <= output.len()`.
         unsafe {
-            encode_chunk_16(
-                input.as_ptr().add(input_index),
-                output.as_mut_ptr().cast::<u8>().add(output_index),
-                hex_128,
-                mask_0f,
-            );
+            let out_ptr = output.as_mut_ptr().cast::<u8>().add(output_index);
+            _mm_storeu_si128(out_ptr.cast(), out0);
+            _mm_storeu_si128(out_ptr.add(16).cast(), out1);
         }
         input_index += 16;
         output_index += 32;
@@ -378,22 +371,12 @@ fn decode_nibbles_128<const UPPERCASE: bool, const STRICT_CASE: bool>(v: __m128i
     _mm_min_epu8(digits, letters)
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 32 reads and SSSE3 is enabled.
 #[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn decode_chunk_32<const UPPERCASE: bool, const STRICT_CASE: bool>(
-    in_ptr: *const u8,
+fn decode_chunk_32<const UPPERCASE: bool, const STRICT_CASE: bool>(
+    in0: __m128i,
+    in1: __m128i,
 ) -> Option<__m128i> {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 32 readable bytes.
-    let (in0, in1) = unsafe {
-        (
-            _mm_loadu_si128(in_ptr.cast()),
-            _mm_loadu_si128(in_ptr.add(16).cast()),
-        )
-    };
-
     let nib0 = decode_nibbles_128::<UPPERCASE, STRICT_CASE>(in0);
     let nib1 = decode_nibbles_128::<UPPERCASE, STRICT_CASE>(in1);
     // Biasing by 127 - 15 sets the sign bit exactly when either nibble is invalid.
@@ -425,7 +408,13 @@ unsafe fn decode_ssse3<const UPPERCASE: bool, const STRICT_CASE: bool>(
     let mut done = 0;
     while done < chunks {
         // SAFETY: `done < chunks` guarantees 32 readable bytes at `in_ptr`.
-        let Some(packed) = (unsafe { decode_chunk_32::<UPPERCASE, STRICT_CASE>(in_ptr) }) else {
+        let (in0, in1) = unsafe {
+            (
+                _mm_loadu_si128(in_ptr.cast()),
+                _mm_loadu_si128(in_ptr.add(16).cast()),
+            )
+        };
+        let Some(packed) = decode_chunk_32::<UPPERCASE, STRICT_CASE>(in0, in1) else {
             break;
         };
         // SAFETY: `done < chunks` guarantees 16 writable bytes at `out_ptr`, in-place writes lag
@@ -469,23 +458,13 @@ fn decode_nibbles_256<const UPPERCASE: bool, const STRICT_CASE: bool>(v: __m256i
     _mm256_min_epu8(digits, letters)
 }
 
-/// # Safety
-///
-/// Caller must ensure `in_ptr` is valid for 64 reads and AVX2 is enabled.
 #[cfg(any(feature = "std", target_feature = "avx2"))]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn decode_chunk_64<const UPPERCASE: bool, const STRICT_CASE: bool>(
-    in_ptr: *const u8,
+fn decode_chunk_64<const UPPERCASE: bool, const STRICT_CASE: bool>(
+    in0: __m256i,
+    in1: __m256i,
 ) -> Option<__m256i> {
-    // SAFETY: Caller guarantees `in_ptr` is valid for 64 readable bytes.
-    let (in0, in1) = unsafe {
-        (
-            _mm256_loadu_si256(in_ptr.cast()),
-            _mm256_loadu_si256(in_ptr.add(32).cast()),
-        )
-    };
-
     let nib0 = decode_nibbles_256::<UPPERCASE, STRICT_CASE>(in0);
     let nib1 = decode_nibbles_256::<UPPERCASE, STRICT_CASE>(in1);
     let err = _mm256_adds_epu8(_mm256_or_si256(nib0, nib1), _mm256_set1_epi8(112));
@@ -519,7 +498,13 @@ unsafe fn decode_avx2<const UPPERCASE: bool, const STRICT_CASE: bool>(
 
     for _ in 0..chunks_64 {
         // SAFETY: `done_32 + 2 <= chunks_32` guarantees 64 readable bytes at `in_ptr`.
-        let Some(packed) = (unsafe { decode_chunk_64::<UPPERCASE, STRICT_CASE>(in_ptr) }) else {
+        let (in0, in1) = unsafe {
+            (
+                _mm256_loadu_si256(in_ptr.cast()),
+                _mm256_loadu_si256(in_ptr.add(32).cast()),
+            )
+        };
+        let Some(packed) = decode_chunk_64::<UPPERCASE, STRICT_CASE>(in0, in1) else {
             return done_32;
         };
         // SAFETY: `done_32 + 2 <= chunks_32` guarantees 32 writable bytes at `out_ptr`, in-place
@@ -534,9 +519,14 @@ unsafe fn decode_avx2<const UPPERCASE: bool, const STRICT_CASE: bool>(
     }
 
     if done_32 < chunks_32 {
-        // SAFETY: `done_32 < chunks_32` guarantees 32 readable bytes at `in_ptr`, and AVX2 implies
-        // SSSE3.
-        if let Some(packed) = unsafe { decode_chunk_32::<UPPERCASE, STRICT_CASE>(in_ptr) } {
+        // SAFETY: `done_32 < chunks_32` guarantees 32 readable bytes at `in_ptr`.
+        let (in0, in1) = unsafe {
+            (
+                _mm_loadu_si128(in_ptr.cast()),
+                _mm_loadu_si128(in_ptr.add(16).cast()),
+            )
+        };
+        if let Some(packed) = decode_chunk_32::<UPPERCASE, STRICT_CASE>(in0, in1) {
             // SAFETY: `done_32 < chunks_32` guarantees 16 writable bytes at `out_ptr`, and this
             // chunk's input was already loaded so in-place writes do not overwrite unread input.
             unsafe { _mm_storeu_si128(out_ptr.cast(), packed) };
